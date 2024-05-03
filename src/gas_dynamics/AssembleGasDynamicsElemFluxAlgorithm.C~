@@ -1,0 +1,350 @@
+/*------------------------------------------------------------------------*/
+/*  Copyright 2014 Sandia Corporation.                                    */
+/*  This software is released under the license detailed                  */
+/*  in the file, LICENSE, which is located in the top-level Nalu          */
+/*  directory structure                                                   */
+/*------------------------------------------------------------------------*/
+
+
+// nalu
+#include <gas_dynamics/AssembleGasDynamicsElemFluxAlgorithm.h>
+#include <Realm.h>
+#include <master_element/MasterElement.h>
+
+// stk_mesh/base/fem
+#include <stk_mesh/base/BulkData.hpp>
+#include <stk_mesh/base/Field.hpp>
+#include <stk_mesh/base/FieldParallel.hpp>
+#include <stk_mesh/base/GetBuckets.hpp>
+#include <stk_mesh/base/GetEntities.hpp>
+#include <stk_mesh/base/MetaData.hpp>
+#include <stk_mesh/base/Part.hpp>
+
+// stk_util
+#include <stk_util/parallel/ParallelReduce.hpp>
+
+namespace sierra{
+namespace nalu{
+
+//==========================================================================
+// Class Definition
+//==========================================================================
+// AssembleGasDynamicsElemFluxAlgorithm - assembles RHS for gas dynamics; AUSM+
+//==========================================================================
+//--------------------------------------------------------------------------
+//-------- constructor -----------------------------------------------------
+//--------------------------------------------------------------------------
+AssembleGasDynamicsElemFluxAlgorithm::AssembleGasDynamicsElemFluxAlgorithm(
+  Realm &realm,
+  stk::mesh::Part *part,
+  ScalarFieldType *density,
+  VectorFieldType *momentum,
+  VectorFieldType *velocity,
+  ScalarFieldType *totalH,
+  ScalarFieldType *pressure,
+  ScalarFieldType *temperature,
+  ScalarFieldType *speedOfSound,
+  ScalarFieldType *viscosity,
+  ScalarFieldType *thermalCond,
+  GenericFieldType *rhsGasDyn)
+  : Algorithm(realm, part),
+    density_(density),
+    momentum_(momentum),
+    velocity_(velocity),
+    totalH_(totalH),
+    pressure_(pressure),
+    temperature_(temperature),
+    speedOfSound_(speedOfSound),
+    viscosity_(viscosity),
+    thermalCond_(thermalCond),
+    rhsGasDyn_(rhsGasDyn),
+    velocityRTM_(NULL),
+    coordinates_(NULL)
+{
+  // save off mising fields
+  stk::mesh::MetaData & metaData = realm_.meta_data();
+  if ( realm_.does_mesh_move() )
+    velocityRTM_ = metaData.get_field<double>(stk::topology::NODE_RANK, "velocity_rtm");
+  else
+    velocityRTM_ = metaData.get_field<double>(stk::topology::NODE_RANK, "velocity");
+  coordinates_ = metaData.get_field<double>(stk::topology::NODE_RANK, realm_.get_coordinates_name());
+}
+
+//--------------------------------------------------------------------------
+//-------- execute ---------------------------------------------------------
+//--------------------------------------------------------------------------
+void
+AssembleGasDynamicsElemFluxAlgorithm::execute()
+{
+  
+  // edge-based upwind MUSCL and CVFEM diffusion
+  stk::mesh::MetaData & metaData = realm_.meta_data();
+
+  // sizes
+  const int nDim = metaData.spatial_dimension();
+  const int cOffset = nDim;
+  const int eOffset = nDim + 1;
+
+  // fixed values
+  double f_dudx[3][3];
+  double f_tauIp[3][3];
+
+  // constants
+  const double oneEighth = 1.0/8.0;
+  const double threeSixTeenth = 3.0/16.0;
+
+  // define some common selectors
+  stk::mesh::Selector s_locally_owned_union = metaData.locally_owned_part()
+    & stk::mesh::selectUnion(partVec_) 
+    & !(realm_.get_inactive_selector());
+
+  //===========================================================
+  // assemble edge-based flux operator to the node
+  //===========================================================
+
+  stk::mesh::BucketVector const& elem_buckets =
+    realm_.get_buckets( stk::topology::ELEM_RANK, s_locally_owned_union );
+  for ( stk::mesh::BucketVector::const_iterator ib = elem_buckets.begin();
+        ib != elem_buckets.end() ; ++ib ) {
+    stk::mesh::Bucket & b = **ib ;
+
+    // extract master element
+    MasterElement *meSCS = sierra::nalu::MasterElementRepo::get_surface_master_element(b.topology());
+
+    // extract master element specifics
+    const int nodesPerElement = meSCS->nodesPerElement_;
+    const int numScsIp = meSCS->numIntPoints_;
+    const int *lrscv = meSCS->adjacentNodes();
+
+    // scratch fields to gather
+    std::vector<double > ws_coordinates(nodesPerElement*nDim);
+    std::vector<double > ws_velocity(nodesPerElement*nDim);
+    std::vector<double > ws_viscosity(nodesPerElement);
+    std::vector<double > ws_thermalCond(nodesPerElement);
+    std::vector<double > ws_temperature(nodesPerElement);
+
+    // scatch fields for geometry
+    std::vector<double > ws_scs_areav(numScsIp*nDim);
+    std::vector<double > ws_dndx(nDim*numScsIp*nodesPerElement);
+    std::vector<double > ws_deriv(nDim*numScsIp*nodesPerElement);
+    std::vector<double > ws_det_j(numScsIp);
+    std::vector<double > ws_shape_function(numScsIp*nodesPerElement);
+    
+    // extract shape function
+    meSCS->shape_fcn(&ws_shape_function[0]);
+
+    const stk::mesh::Bucket::size_type length   = b.size();
+
+    for ( stk::mesh::Bucket::size_type k = 0 ; k < length ; ++k ) {
+
+      stk::mesh::Entity const * elem_node_rels = b.begin_nodes(k);
+
+      //===============================================
+      // gather nodal data
+      //===============================================
+      int num_nodes = b.num_nodes(k);
+      for ( int ni = 0; ni < num_nodes; ++ni ) {
+        stk::mesh::Entity node = elem_node_rels[ni];
+        ws_viscosity[ni] = *stk::mesh::field_data(*viscosity_, node);
+        ws_thermalCond[ni] = *stk::mesh::field_data(*thermalCond_, node);
+        ws_temperature[ni] = *stk::mesh::field_data(*temperature_, node);
+        double * coords = stk::mesh::field_data(*coordinates_, node);
+        double * velocity = stk::mesh::field_data(*velocity_, node);
+        const int niNdim = ni*nDim;
+        for ( int j=0; j < nDim; ++j ) {
+          ws_coordinates[niNdim+j] = coords[j];
+          ws_velocity[niNdim+j] = velocity[j];
+        }
+      }
+      
+      // compute scs integration point areavec and dNdx
+      double scs_error = 0.0;
+      meSCS->determinant(1, &ws_coordinates[0], &ws_scs_areav[0], &scs_error);
+      meSCS->grad_op(1, &ws_coordinates[0], &ws_dndx[0], &ws_deriv[0], &ws_det_j[0], &scs_error);
+        
+      for ( int ip = 0; ip < numScsIp; ++ip ) {
+        
+        // saved off offset
+        const int ipNdim = ip*nDim;
+        
+        // left and right nodes for this ip
+        const int il = lrscv[2*ip];
+        const int ir = lrscv[2*ip+1];
+
+        // compute aMag
+        double aMag = 0.0;
+        for ( int j = 0; j < nDim; ++j ) {
+          const double axj = ws_scs_areav[ipNdim+j];
+          aMag += axj*axj;
+        }
+        aMag = std::sqrt(aMag);
+        
+        // compute scs point values
+        double viscIp = 0.0;
+        double thermalCondIp = 0.0;
+        const int ipNpe = ip*nodesPerElement;
+
+        for ( int ic = 0; ic < nodesPerElement; ++ic ) {
+          const double r = ws_shape_function[ipNpe+ic];
+          viscIp += r*ws_viscosity[ic];
+          thermalCondIp += r*ws_thermalCond[ic];
+          const int offSetDnDx = nDim*nodesPerElement*ip + ic*nDim;
+          for ( int i = 0; i < nDim; ++i ) {
+            for ( int j = 0; j < nDim; ++j ) {
+              f_dudx[i][j] += ws_dndx[offSetDnDx+j]*ws_velocity[ic*nDim+j];
+            }
+          }
+        }
+        
+        // zero f_tauIp
+        for ( int i = 0; i < nDim; ++i ) {
+          for ( int j = 0; j < nDim; ++j ) {
+            f_tauIp[i][j] = 0.0;
+          }
+        }
+        
+        // divU
+        double divU = 0.0;
+        for ( int j = 0; j < nDim; ++j)
+          divU += f_dudx[j][j];
+        
+        // left and right nodes
+        stk::mesh::Entity nodeL = elem_node_rels[il];
+        stk::mesh::Entity nodeR = elem_node_rels[ir];
+                
+        // rho
+        const double densityL = *stk::mesh::field_data( *density_, nodeL);
+        const double densityR = *stk::mesh::field_data( *density_, nodeR);
+        
+        // rho*u_i
+        const double * momentumL = stk::mesh::field_data( *momentum_, nodeL);
+        const double * momentumR = stk::mesh::field_data( *momentum_, nodeR);
+        
+        // u_i
+        const double * velocityL = stk::mesh::field_data( *velocity_, nodeL);
+        const double * velocityR = stk::mesh::field_data( *velocity_, nodeR);
+        
+        // u_i - v_i
+        const double * vrtmL = stk::mesh::field_data( *velocityRTM_, nodeL);
+        const double * vrtmR = stk::mesh::field_data( *velocityRTM_, nodeR);
+        
+        // rhoH
+        const double totalHL = *stk::mesh::field_data( *totalH_, nodeL);
+        const double totalHR = *stk::mesh::field_data( *totalH_, nodeR);
+        
+        // p
+        const double pressureL = *stk::mesh::field_data( *pressure_, nodeL);
+        const double pressureR = *stk::mesh::field_data( *pressure_, nodeR);
+                
+        // c
+        const double speedOfSoundL = *stk::mesh::field_data( *speedOfSound_, nodeL);
+        const double speedOfSoundR = *stk::mesh::field_data( *speedOfSound_, nodeR);
+                        
+        // left/right nodes (to be assembled)
+        double * rhsGasDynL = stk::mesh::field_data( *rhsGasDyn_, nodeL);
+        double * rhsGasDynR = stk::mesh::field_data( *rhsGasDyn_, nodeR);
+        
+        double machNumberL = 0.0;
+        double machNumberR = 0.0;
+        for ( int j = 0; j < nDim; ++j) {
+          const double nj = ws_scs_areav[ipNdim+j]/aMag;
+          const double meanSpeedOfSound = 0.5*(speedOfSoundL + speedOfSoundR);
+          machNumberL += vrtmL[j]*nj/meanSpeedOfSound;
+          machNumberR += vrtmR[j]*nj/meanSpeedOfSound;
+        }
+        
+        // AUSM quantities
+        const double absML = std::abs(machNumberL);
+        const double absMR = std::abs(machNumberR);
+        const double signML = machNumberL > 0.0 ? 1.0 : -1.0;
+        const double signMR = machNumberR > 0.0 ? 1.0 : -1.0;
+        
+        // script{M}+Left and script{M}-Right
+        const double scriptMpL = ( absML >= 1.0) 
+          ? 0.5*(machNumberL + absML)
+          : 0.25*std::pow(machNumberL + 1.0, 2.0) 
+          + oneEighth*std::pow(machNumberL*machNumberL - 1.0, 2.0);
+        
+        const double scriptMmR = ( absMR >= 1.0) 
+          ? 0.5*(machNumberR - absMR)
+          : -0.25*std::pow(machNumberR - 1.0, 2.0) 
+          - oneEighth*std::pow(machNumberR*machNumberR - 1.0, 2.0);
+        
+        // script{P}+Left and script{P}-Right
+        const double scriptPpL = ( absML >= 1.0 )
+          ? 0.5*(1.0 + signML) 
+          : 0.25*std::pow(machNumberL + 1.0, 2.0)*(2.0 - machNumberL) 
+          + threeSixTeenth*machNumberL*std::pow(machNumberL*machNumberL - 1.0, 2.0);
+        
+        const double scriptPmR = ( absMR >= 1.0 )
+          ? 0.5*(1.0 - signMR) 
+          : 0.25*std::pow(machNumberR - 1.0, 2.0)*(2.0 + machNumberR) 
+          - threeSixTeenth*machNumberR*std::pow(machNumberR*machNumberR - 1.0, 2.0);
+        
+        // left-right m's and p's
+        const double mLR = scriptMpL + scriptMmR;
+        const double pLR = scriptPpL*pressureL + scriptPmR*pressureR;
+        
+        // momentum first
+        for ( int i = 0; i < nDim; ++i ) {
+          
+          // advective
+          const double fmL = momentumL[i]*speedOfSoundL;
+          const double fmR = momentumR[i]*speedOfSoundR;
+          const double fmLR = aMag*(0.5*mLR*(fmL + fmR) - 0.5*std::abs(mLR)*(fmR - fmL)) + pLR*ws_scs_areav[ipNdim+i];
+          
+          // diffusive
+          double dfmA = 2.0/3.0*viscIp*divU*ws_scs_areav[ipNdim+i];
+          f_tauIp[i][i] = -2.0/3.0*viscIp*divU;
+          for ( int j = 0; j < nDim; ++j ) {
+            const double axj = ws_scs_areav[ipNdim+j];
+            const double twoMuSij = viscIp*(f_dudx[i][j] + f_dudx[j][i]);
+            dfmA += -twoMuSij*axj;
+            f_tauIp[i][j] += twoMuSij;
+          }
+          
+          // advection/diffusion assembly
+          rhsGasDynL[i] -= (fmLR + dfmA);
+          rhsGasDynR[i] += (fmLR + dfmA);
+        }
+        
+        // continuity 
+        const double fcL = densityL*speedOfSoundL;
+        const double fcR = densityR*speedOfSoundR;
+        const double fcLR = aMag*(0.5*mLR*(fcL + fcR) - 0.5*std::abs(mLR)*(fcR - fcL));
+        // no diffusion
+        rhsGasDynL[cOffset] -= fcLR;
+        rhsGasDynR[cOffset] += fcLR;
+        
+        // total energy
+        const double feL = totalHL*speedOfSoundL;
+        const double feR = totalHR*speedOfSoundR;
+        const double feLR = aMag*(0.5*mLR*(feL + feR) - 0.5*std::abs(mLR)*(feR - feL));
+        
+        // diffusion, LHS is: d/dxj(qj) - d/dxj(ui*tauij)
+        double dfeA = 0.0;
+        for ( int ic = 0; ic < nodesPerElement; ++ic ) {
+          const int offSetDnDx = nDim*nodesPerElement*ip + ic*nDim;
+          double sum = 0.0;
+          for ( int j = 0; j < nDim; ++j ) {
+            sum += -thermalCondIp*ws_dndx[offSetDnDx+j]*ws_scs_areav[ipNdim+j];
+          }
+          dfeA += sum*ws_temperature[ic];
+        }
+        
+        for ( int i = 0; i < nDim; ++i ) {
+          const double uiIp = 0.5*(velocityR[i] + velocityL[i]);
+          for ( int j = 0; j < nDim; ++j ) {
+            dfeA += -uiIp*f_tauIp[i][j]*ws_scs_areav[ipNdim+j];
+          }
+        }
+        
+        rhsGasDynL[eOffset] -= (feLR + dfeA);
+        rhsGasDynR[eOffset] += (feLR + dfeA);
+      }
+    }
+  }
+}
+
+} // namespace nalu
+} // namespace Sierra
