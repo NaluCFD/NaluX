@@ -31,6 +31,15 @@ BoundaryCondition * BoundaryCondition::load(const YAML::Node & node)
                     << " on " << symmetryBC.targetName_ << std::endl;
     return &symmetryBC;
   }
+  else if (node["periodic_boundary_condition"]) {
+    PeriodicBoundaryConditionData& periodicBC = *new PeriodicBoundaryConditionData(*parent());
+    node >> periodicBC;
+    NaluEnv::self().naluOutputP0() << "Periodic BC name:    " << periodicBC.bcName_
+                    << " between " << periodicBC.monarchSubject_.monarch_
+                    << " and "<< periodicBC.monarchSubject_.subject_ << std::endl;
+    return &periodicBC;
+  }
+
   else {
     throw std::runtime_error("parser error BoundaryConditions::load: no such bc type");
   }
