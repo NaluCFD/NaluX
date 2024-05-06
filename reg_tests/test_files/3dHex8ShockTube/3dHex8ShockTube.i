@@ -83,27 +83,24 @@ realms:
 
     boundary_conditions:
 
-    - symmetry_boundary_condition: bc_left
+    - symmetry_boundary_condition: bc_front
       target_name: surface_1
       symmetry_user_data:
 
-    - symmetry_boundary_condition: bc_right
+    - symmetry_boundary_condition: bc_back
       target_name: surface_2
       symmetry_user_data:
 
+    - periodic_boundary_condition: bc_left_right
+      target_name: [surface_3, surface_4]
+      periodic_user_data:
+        search_tolerance: 1.e-5
+
     - symmetry_boundary_condition: bc_top
-      target_name: surface_3
-      symmetry_user_data:
-
-    - symmetry_boundary_condition: bc_bot
-      target_name: surface_4
-      symmetry_user_data:
-
-    - symmetry_boundary_condition: bc_left
       target_name: surface_5
       symmetry_user_data:
 
-    - symmetry_boundary_condition: bc_right
+    - symmetry_boundary_condition: bc_bot
       target_name: surface_6
       symmetry_user_data:
 
