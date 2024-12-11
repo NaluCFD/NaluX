@@ -33,7 +33,6 @@
 // props; algs, evaluators and data
 #include "property_evaluator/ConstantPropertyEvaluator.h"
 #include "property_evaluator/EnthalpyPropertyEvaluator.h"
-#include "property_evaluator/InverseDualVolumePropAlgorithm.h"
 #include "property_evaluator/IdealGasPropertyEvaluator.h"
 #include "property_evaluator/MaterialPropertyData.h"
 #include "property_evaluator/ReferencePropertyData.h"
@@ -944,10 +943,7 @@ Realm::setup_property()
         
         case GEOMETRIC_MAT:
         {
-          // propery is a function of inverse dual volume
-          InverseDualVolumePropAlgorithm *auxAlg
-            = new InverseDualVolumePropAlgorithm( *this, targetPart, thePropField);
-          propertyAlg_.push_back(auxAlg);
+          throw std::runtime_error("Realm::setup_property: no geometric_mat support:");
         }
         break;
       
